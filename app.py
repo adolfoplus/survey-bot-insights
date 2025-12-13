@@ -2,8 +2,8 @@
 # STREAMLIT SAFE BOOT
 # =========================================================
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""   # evita CUDA init
-HF_OK = False  # transformers DESACTIVADO al inicio (CRÍTICO)
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+HF_OK = False
 
 import re
 import numpy as np
@@ -14,158 +14,182 @@ import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 
-# Sentiment básico (siempre disponible)
+# Sentiment básico
 try:
     import nltk
     from nltk.sentiment import SentimentIntensityAnalyzer
     nltk.download("vader_lexicon")
     vader = SentimentIntensityAnalyzer()
-    NLTK_OK = True
 except Exception:
-    NLTK_OK = False
     vader = None
 
 # =========================================================
-# UI CONFIG
+# PAGE CONFIG
 # =========================================================
 st.set_page_config(
     page_title="Survey Bot Insights",
     layout="wide"
 )
 
+# =========================================================
+# CLEAN GOOGLE-LIKE STYLE
+# =========================================================
 st.markdown("""
 <style>
-.stApp { background-color: #000000; }
-html, body, [class*="st-"], p, label, span, h1, h2, h3 {
-    color: #00FF00 !important;
-    font-family: "Courier New", monospace;
+html, body, .stApp {
+    background-color: #ffffff;
+    color: #202124;
+    font-family: "Roboto", "Arial", sans-serif;
+}
+
+h1 {
+    font-size: 2.4rem;
+    font-weight: 600;
+}
+
+h2 {
+    font-size: 1.6rem;
+    margin-top: 2rem;
+}
+
+[data-testid="stSidebar"] {
+    background-color: #f8f9fa;
+    border-right: 1px solid #e0e0e0;
+}
+
+.metric-card {
+    padding: 1.2rem;
+    border-radius: 12px;
+    background: #f1f3f4;
+    text-align: center;
+}
+
+.stDataFrame {
+    background: white;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 Survey Bot Insights")
-st.caption("Análisis de comentarios abiertos para mejorar bots e intents")
-
 # =========================================================
-# HELPERS
+# HEADER
 # =========================================================
-def detect_response_columns(df):
-    cols = [c for c in df.columns if str(c).lower().startswith("respuesta")]
-    cols.sort()
-    return cols
+st.title("Survey Bot Insights")
+st.caption("Analyze open-ended survey responses to improve bots, intents, and services")
 
-def clean_text(row, cols):
-    parts = []
-    for c in cols:
-        v = str(row.get(c, "")).strip()
-        if v:
-            parts.append(v)
-    return " ".join(parts)
-
-def normalize(text):
-    text = text.lower()
-    text = re.sub(r"[^\w\sáéíóúñü]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def sentiment(text):
-    if vader:
-        s = vader.polarity_scores(text)["compound"]
-        lab = "positivo" if s >= 0.05 else ("negativo" if s <= -0.05 else "neutral")
-        return s, lab
-    return 0.0, "neutral"
+st.divider()
 
 # =========================================================
 # SIDEBAR
 # =========================================================
 with st.sidebar:
-    st.header("⚙️ Configuración")
+    st.subheader("Configuration")
 
-    uploaded = st.file_uploader("Sube tu CSV", type=["csv"])
-    sep = st.selectbox("Separador", [",", ";", "|", "\t"], index=0)
+    uploaded = st.file_uploader("Upload your CSV", type=["csv"])
+    sep = st.selectbox("CSV separator", [",", ";", "|", "\t"], index=0)
 
-    k = st.slider("Número de clusters (temas)", 2, 12, 5)
+    st.divider()
+    st.subheader("Topic detection")
+
+    k = st.slider("Number of topics (clusters)", 2, 12, 5)
     max_features = st.slider("TF-IDF features", 2000, 20000, 8000)
 
-    use_llm = st.checkbox(
-        "Activar análisis avanzado (Zero-shot / LLM)",
-        value=False,
-        help="Se carga SOLO después de subir CSV"
-    )
+# =========================================================
+# HELPERS
+# =========================================================
+def detect_response_columns(df):
+    return [c for c in df.columns if c.lower().startswith("respuesta")]
+
+def clean_text(row, cols):
+    return " ".join(str(row[c]) for c in cols if str(row[c]).strip())
+
+def normalize(text):
+    text = text.lower()
+    text = re.sub(r"[^\w\sáéíóúñü]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def sentiment(text):
+    if vader:
+        s = vader.polarity_scores(text)["compound"]
+        lab = "Positive" if s >= 0.05 else ("Negative" if s <= -0.05 else "Neutral")
+        return s, lab
+    return 0.0, "Neutral"
 
 # =========================================================
 # MAIN FLOW
 # =========================================================
 if not uploaded:
-    st.info("⬅️ Sube un CSV con columnas tipo: respuesta1, respuesta2, ...")
+    st.info("Upload a CSV with columns like respuesta1, respuesta2, ...")
     st.stop()
 
-# 🔓 AHORA sí permitimos transformers si el usuario lo pide
-if use_llm:
-    HF_OK = True
-
-# Cargar CSV
 df_raw = pd.read_csv(uploaded, sep=sep)
 resp_cols = detect_response_columns(df_raw)
 
 if not resp_cols:
-    st.error("No se encontraron columnas 'respuestaX'")
+    st.error("No columns starting with 'respuesta' were found.")
     st.stop()
 
 df = df_raw.copy()
 df["text"] = df.apply(lambda r: clean_text(r, resp_cols), axis=1)
 df = df[df["text"].str.len() > 0].reset_index(drop=True)
 
-st.success(f"Filas analizadas: {len(df)}")
+# =========================================================
+# ANALYSIS
+# =========================================================
+df["sent_score"], df["sentiment"] = zip(*df["text"].map(sentiment))
+
+texts_norm = df["text"].map(normalize)
+tfidf = TfidfVectorizer(max_features=max_features)
+X = tfidf.fit_transform(texts_norm)
+
+km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+df["topic"] = km.fit_predict(X)
 
 # =========================================================
-# SENTIMENT
+# METRICS
 # =========================================================
-with st.spinner("Analizando sentimiento..."):
-    df["sent_score"], df["sent_label"] = zip(*df["text"].map(sentiment))
+m1, m2, m3 = st.columns(3)
 
-# =========================================================
-# TF-IDF + KMEANS
-# =========================================================
-with st.spinner("Detectando temas (TF-IDF + KMeans)..."):
-    texts_norm = df["text"].map(normalize).tolist()
-    tfidf = TfidfVectorizer(max_features=max_features)
-    X = tfidf.fit_transform(texts_norm)
+with m1:
+    st.metric("Comments analyzed", len(df))
 
-    km = KMeans(n_clusters=k, random_state=42, n_init="auto")
-    df["cluster"] = km.fit_predict(X)
+with m2:
+    st.metric("Topics detected", k)
 
-# =========================================================
-# DASHBOARD
-# =========================================================
-c1, c2, c3 = st.columns(3)
-c1.metric("Comentarios", len(df))
-c2.metric("Clusters", k)
-c3.metric("Sentimiento negativo (%)", f"{(df['sent_label']=='negativo').mean()*100:.1f}%")
+with m3:
+    st.metric(
+        "Negative sentiment",
+        f"{(df['sentiment'] == 'Negative').mean() * 100:.1f}%"
+    )
 
 st.divider()
 
-# Clusters
-st.subheader("📌 Temas detectados")
-cluster_counts = df["cluster"].value_counts().sort_index()
+# =========================================================
+# VISUALS
+# =========================================================
+st.subheader("Detected topics")
+
+topic_counts = df["topic"].value_counts().sort_index()
 fig, ax = plt.subplots()
-ax.barh(cluster_counts.index.astype(str), cluster_counts.values)
-ax.invert_yaxis()
+ax.barh(topic_counts.index.astype(str), topic_counts.values)
+ax.set_xlabel("Number of comments")
 st.pyplot(fig)
 
-# Sentimiento por cluster
-st.subheader("😡 Sentimiento promedio por tema")
-grp = df.groupby("cluster")["sent_score"].mean().sort_values()
+st.subheader("Average sentiment by topic")
+
+grp = df.groupby("topic")["sent_score"].mean().sort_values()
 fig2, ax2 = plt.subplots()
 ax2.barh(grp.index.astype(str), grp.values)
-ax2.invert_yaxis()
+ax2.set_xlabel("Average sentiment score")
 st.pyplot(fig2)
 
-# Ejemplos
-st.subheader("🧪 Ejemplos por tema")
-chosen = st.selectbox("Cluster", sorted(df["cluster"].unique()))
+# =========================================================
+# EXAMPLES
+# =========================================================
+st.subheader("Example comments")
+
+chosen = st.selectbox("Select topic", sorted(df["topic"].unique()))
 st.dataframe(
-    df[df["cluster"] == chosen][["text", "sent_label"]].head(15),
+    df[df["topic"] == chosen][["text", "sentiment"]].head(15),
     use_container_width=True
 )
 
@@ -173,41 +197,14 @@ st.dataframe(
 # EXPORT
 # =========================================================
 st.divider()
-st.subheader("⬇️ Exportar resultados")
+st.subheader("Export results")
 
-out = df[["text", "cluster", "sent_label", "sent_score"]]
+out = df[["text", "topic", "sentiment", "sent_score"]]
 csv = out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 st.download_button(
-    "Descargar CSV",
+    "Download CSV",
     data=csv,
     file_name="survey_bot_insights_results.csv",
     mime="text/csv"
 )
-
-# =========================================================
-# OPTIONAL LLM SUMMARY (SAFE)
-# =========================================================
-if use_llm and HF_OK:
-    try:
-        from transformers import pipeline
-        summarizer = pipeline(
-            "summarization",
-            model="sshleifer/distilbart-cnn-12-6",
-            device=-1
-        )
-
-        st.divider()
-        st.subheader("🧠 Resumen ejecutivo (LLM)")
-
-        summary_text = (
-            f"Total comentarios: {len(df)}. "
-            f"Clusters: {cluster_counts.to_dict()}. "
-            f"Sentimiento: {df['sent_label'].value_counts().to_dict()}."
-        )
-
-        res = summarizer(summary_text, max_length=120, min_length=50, do_sample=False)
-        st.write(res[0]["summary_text"])
-
-    except Exception:
-        st.warning("LLM no disponible en este entorno. Se usó análisis base.")
