@@ -4,7 +4,7 @@ numpy
 scikit-learn
 matplotlib
 nltk
-langdetect
 transformers
 torch
 sentencepiece
+
