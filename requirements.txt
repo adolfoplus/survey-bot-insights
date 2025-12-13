@@ -4,7 +4,4 @@ numpy
 scikit-learn
 matplotlib
 nltk
-transformers
-torch
-sentencepiece
 
