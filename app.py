@@ -239,14 +239,35 @@ def distinctive_terms(texts_a, texts_b, top_n=15):
 # =========================================================
 # TOPICS
 # =========================================================
-TOPIC_RULES = {
-    "Payment & Billing": ["pago", "factura", "cobro", "cobraron", "precio", "tarjeta", "dinero", "reembolso"],
-    "Response Time": ["lento", "tarda", "espera", "demora", "esperando"],
-    "Human Agent Request": ["humano", "agente", "asesor", "persona"],
-    "Technical Errors": ["error", "falla", "bug", "problema", "no funciona", "se cae", "traba"],
-    "Account & Login": ["login", "cuenta", "acceso", "password", "contrasena"],
-    "Delivery & Orders": ["envio", "entrega", "pedido"],
-}
+DEFAULT_RULES = """Payment & Billing: pag, factura, cobr, reembols, tarjeta, monto, referencia, dinero, precio
+Response Time: lent, tard, espera, demor, rapid, minutos, tiempo
+Human Agent Request: humano, asesor, agente, persona, transfer, call center, llamar
+Technical Errors: error, falla, bug, traba, se cierra, cerro, reinstal, descarg, pdf, no funciona
+Account & Login: contrasena, password, acceso, acceder, entrar, cuenta, codigo, verificacion, bloque, correo
+Delivery & Orders: pedido, envio, entrega, guia, rastre, direccion, llega"""
+
+
+def parse_rules(text: str) -> dict:
+    rules = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        name, terms = line.split(":", 1)
+        terms = [normalize(t) for t in terms.split(",") if normalize(t)]
+        if name.strip() and terms:
+            rules[name.strip()] = terms
+    return rules
+
+
+def rule_topics(texts_norm, rules: dict) -> np.ndarray:
+    """Assign each text to the rule with most term hits (terms match word prefixes)."""
+    pats = {n: [re.compile(r"\b" + re.escape(t)) for t in ts] for n, ts in rules.items()}
+    out = []
+    for s in texts_norm:
+        hits = {n: sum(bool(p.search(s)) for p in ps) for n, ps in pats.items()}
+        best = max(hits, key=hits.get) if hits else None
+        out.append(best if best and hits[best] > 0 else None)
+    return np.array(out, dtype=object)
 
 
 @st.cache_data(show_spinner="Detecting topics…")
@@ -256,7 +277,7 @@ def fit_topics(texts_norm: tuple, k: int | None, max_features: int, seed: int = 
                             ngram_range=(1, 2), min_df=2 if n >= 50 else 1, sublinear_tf=True)
     X = tfidf.fit_transform(texts_norm)
     n_unique = len(set(texts_norm))
-    k_max = max(2, min(12, n_unique - 1))
+    k_max = max(2, min(10, n_unique - 1))
     rng = np.random.RandomState(seed)
     sample = rng.choice(n, min(n, 3000), replace=False)
 
@@ -264,37 +285,63 @@ def fit_topics(texts_norm: tuple, k: int | None, max_features: int, seed: int = 
         return silhouette_score(X[sample], lbl[sample]) if len(set(lbl[sample])) > 1 else np.nan
 
     sil_by_k = {}
-    if k is None:  # auto: best silhouette
+    if k is None:
         for kk in range(2, k_max + 1):
             lbl = KMeans(n_clusters=kk, random_state=seed, n_init=10).fit_predict(X)
             sil_by_k[kk] = sil(lbl)
-        k = max(sil_by_k, key=lambda kk: np.nan_to_num(sil_by_k[kk], nan=-1))
+        best = np.nanmax(list(sil_by_k.values()))
+        # smallest k within 90% of the best silhouette (avoids over-splitting short texts)
+        k = min(kk for kk, v in sil_by_k.items() if np.nan_to_num(v, nan=-1) >= 0.9 * best)
     k = min(k, k_max)
     labels = KMeans(n_clusters=k, random_state=seed, n_init=10).fit_predict(X)
     return X, labels, tfidf.get_feature_names_out(), sil(labels), sil_by_k
 
 
-def name_topics(X, labels, feature_names, texts_norm, top_n=5):
+def keyword_names(X, labels, feature_names, top_n=5, prefix=""):
     names, kw_map = {}, {}
     used = set()
-    texts_norm = np.asarray(texts_norm)
     for t in np.unique(labels):
         idx = np.where(labels == t)[0]
         mean = np.asarray(X[idx].mean(axis=0)).ravel()
         kws = [feature_names[i] for i in mean.argsort()[::-1][:top_n]]
         kw_map[t] = ", ".join(kws)
-        # Rule name only if ≥30% of the topic's texts actually contain a rule term
-        best, best_share = None, 0.0
-        for name, terms in TOPIC_RULES.items():
-            share = np.mean([any(term in s for term in terms) for s in texts_norm[idx]])
-            if share > best_share:
-                best, best_share = name, share
-        name = best if best_share >= 0.30 else " / ".join(kws[:3]).title()
-        if name in used:  # keep topics distinct instead of silently merging them
-            name = f"{name} ({', '.join(kws[:2])})"
+        name = prefix + " / ".join(kws[:3]).title()
+        if name in used:
+            name = f"{name} ({kws[3] if len(kws) > 3 else t})"
         used.add(name)
         names[t] = name
     return names, kw_map
+
+
+def assign_topics(texts_norm, mode, rules, k, max_features):
+    """Returns topic_name array, keywords array, info dict."""
+    texts_norm = np.asarray(texts_norm, dtype=object)
+    names = np.empty(len(texts_norm), dtype=object)
+    kws = np.empty(len(texts_norm), dtype=object)
+    info = {"sil": np.nan, "sil_by_k": {}, "rule_coverage": 0.0}
+    if mode.startswith("Rules") and rules:
+        r = rule_topics(texts_norm, rules)
+        mask = np.array([x is not None for x in r])
+        names[mask] = r[mask]
+        for n_, ts in rules.items():
+            kws[names == n_] = ", ".join(ts[:6])
+        info["rule_coverage"] = mask.mean()
+        rest = np.where(~mask)[0]
+        prefix = "Other: "
+    else:
+        rest = np.arange(len(texts_norm))
+        prefix = ""
+    if len(rest) >= 6 and len(set(texts_norm[rest])) >= 3:
+        X, lbl, feats, sil, sil_by_k = fit_topics(tuple(texts_norm[rest]), k, max_features)
+        nm, kw = keyword_names(X, lbl, feats, prefix=prefix)
+        names[rest] = [nm[t] for t in lbl]
+        kws[rest] = [kw[t] for t in lbl]
+        info.update(sil=sil, sil_by_k=sil_by_k)
+    elif len(rest):
+        names[rest] = "Other"
+        kws[rest] = ""
+    return names, kws, info
+
 
 # =========================================================
 # DATA PREP
@@ -376,13 +423,49 @@ def setup_page():
     st.set_page_config(page_title="Survey Bot Insights", layout="wide")
     st.markdown("""
     <style>
-    html, body, .stApp { background-color: #FAFAFA; color: #1F1F1F;
-        font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    h1 { font-size: 2.3rem; font-weight: 600; }
-    h2 { font-size: 1.6rem; font-weight: 500; margin-top: 2rem; }
-    [data-testid="stSidebar"] { background-color: #FFFFFF; border-right: 1px solid #E5E7EB; }
-    [data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; padding: 1.2rem; }
-    hr { border: none; border-top: 1px solid #E5E7EB; margin: 2rem 0; }
+    :root { --bg:#FFFFFF; --panel:#FFFFFF; --text:#3A3A3A; --muted:#6B6B6B;
+            --line:#E3E3E3; --accent:#F2C300; }
+    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background-color: var(--bg) !important; color: var(--text) !important;
+        font-family: "Avenir Next", "Avenir", "Segoe UI", system-ui, sans-serif; }
+    /* every text element: force readable gray, whatever the browser theme */
+    .stApp p, .stApp li, .stApp span, .stApp label, .stApp div, .stApp h1, .stApp h2,
+    .stApp h3, .stApp h4, .stApp small, .stApp strong { color: var(--text); }
+    h1 { font-size: 2.3rem !important; font-weight: 600 !important; color: #4A4A4A !important; }
+    h2, h3 { font-weight: 500 !important; color: #4A4A4A !important; }
+    [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: var(--muted) !important; }
+
+    /* sidebar */
+    [data-testid="stSidebar"] { background-color: #F7F7F7 !important; border-right: 1px solid var(--line); }
+    [data-testid="stSidebar"] * { color: var(--text) !important; }
+    [data-testid="stWidgetLabel"] p { color: var(--text) !important; font-weight: 500; opacity: 1 !important; }
+    [data-testid="stSliderTickBarMin"], [data-testid="stSliderTickBarMax"] { color: var(--muted) !important; }
+
+    /* inputs */
+    [data-baseweb="select"] > div, [data-baseweb="input"] > div, textarea, input {
+        background-color: #FFFFFF !important; color: var(--text) !important; border-color: #CFCFCF !important; }
+    [data-testid="stFileUploaderDropzone"] { background-color: #FFFFFF !important; border: 1px dashed #BDBDBD !important; }
+
+    /* tabs */
+    button[data-baseweb="tab"] p { color: var(--muted) !important; font-size: 1rem; }
+    button[data-baseweb="tab"][aria-selected="true"] p { color: #3A3A3A !important; font-weight: 600; }
+    [data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
+    [data-baseweb="tab-border"] { background-color: var(--line) !important; }
+
+    /* metric cards */
+    [data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--line);
+        border-top: 3px solid var(--accent); border-radius: 12px; padding: 1rem 1.1rem; }
+    [data-testid="stMetricLabel"] p { color: var(--muted) !important; font-size: .9rem !important; }
+    [data-testid="stMetricValue"] { color: #3A3A3A !important; font-size: 1.7rem !important; }
+    [data-testid="stMetricValue"] div { overflow: visible !important; text-overflow: clip !important; }
+
+    /* tables, alerts, dividers */
+    [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 10px; }
+    [data-testid="stAlert"] { background-color: #FFFBEA !important; border: 1px solid #F2C300 !important; }
+    [data-testid="stAlert"] * { color: var(--text) !important; }
+    hr { border: none; border-top: 1px solid var(--line) !important; margin: 1.5rem 0; }
+    .stDownloadButton button, .stButton button { background:#FFFFFF !important; color: var(--text) !important;
+        border: 1px solid var(--accent) !important; }
     </style>""", unsafe_allow_html=True)
     st.title("Survey Bot Insights")
     st.caption("Understand what users are really saying and where your bot needs improvement")
@@ -457,8 +540,14 @@ def main(df_override: pd.DataFrame | None = None):
         thr = st.slider("Neutral band (±)", 0.0, 0.5, 0.05, 0.01)
         st.divider()
         st.subheader("Topic detection")
-        auto_k = st.toggle("Choose number of topics automatically", value=True)
-        k_manual = st.slider("Number of topics", 2, 12, 5, disabled=auto_k)
+        topic_mode = st.radio("Method", ["Rules + clustering (recommended)", "Clustering only"],
+                              help="Rules assign known topics by keywords; texts that match no rule "
+                                   "are grouped automatically.")
+        rules_text = st.text_area("Topic rules (Topic: term1, term2, …)", DEFAULT_RULES, height=220,
+                                  disabled=topic_mode == "Clustering only",
+                                  help="Terms match the start of words: 'rastre' matches rastreo/rastrear.")
+        auto_k = st.toggle("Choose number of clusters automatically", value=True)
+        k_manual = st.slider("Number of clusters", 2, 10, 5, disabled=auto_k)
         max_features = st.slider("TF-IDF features", 500, 20000, 8000, step=500)
         min_n = st.number_input("Min. texts per group to report", 1, 1000, 5)
 
@@ -476,20 +565,21 @@ def main(df_override: pd.DataFrame | None = None):
     df["text_norm"] = df["text"].map(normalize)
 
     try:
-        X, labels, feats, sil, sil_by_k = fit_topics(
-            tuple(df["text_norm"]), None if auto_k else int(k_manual), int(max_features))
+        tn, tk, tinfo = assign_topics(df["text_norm"].values, topic_mode, parse_rules(rules_text),
+                                      None if auto_k else int(k_manual), int(max_features))
     except ValueError:
         st.error("Texts are too short or only contain stopwords — topics cannot be computed.")
         st.stop()
-    names, kw_map = name_topics(X, labels, feats, df["text_norm"].values)
-    df["topic"] = labels
-    df["topic_name"] = df["topic"].map(names)
-    df["topic_keywords"] = df["topic"].map(kw_map)
+    df["topic_name"] = tn
+    df["topic_keywords"] = tk
+    sil, sil_by_k = tinfo["sil"], tinfo["sil_by_k"]
 
     exclude = set(text_cols) | {"_row", "text", "text_norm", "source_column", "position", "n_words",
-                                "sent_score", "sentiment", "topic", "topic_name", "topic_keywords"}
+                                "sent_score", "sentiment", "topic_name", "topic_keywords"}
     date_col = detect_date_column(df_raw)
-    cat_cols = categorical_columns(df_raw, exclude | ({date_col} if date_col else set()))
+    label_cols = {c for c in df_raw.columns if df_raw[c].astype(str).str.lower().str.strip()
+                  .isin(LABEL_MAP).mean() > 0.8}
+    cat_cols = categorical_columns(df_raw, exclude | label_cols | ({date_col} if date_col else set()))
     num_cols = numeric_columns(df_raw, exclude)
 
     topic_tbl, topic_tests = group_stats(df, "topic_name")
@@ -567,20 +657,25 @@ def main(df_override: pd.DataFrame | None = None):
             tr = dd.set_index("_date").resample(freq).agg(
                 texts=("text", "count"), mean_score=("sent_score", "mean"),
                 pct_negative=("sentiment", lambda x: 100 * (x == "Negative").mean()))
-            st.line_chart(tr[["mean_score"]], height=240)
-            st.line_chart(tr[["pct_negative"]], height=240)
+            st.line_chart(tr[["mean_score"]], height=240, color="#F2C300")
+            st.line_chart(tr[["pct_negative"]], height=240, color="#7A7A7A")
             st.dataframe(tr.round(2), width="stretch")
 
     # ---------------- Topics ----------------
     with tabs[2]:
         st.subheader("Topics")
-        q = "good" if sil > 0.25 else "fair" if sil > 0.1 else "weak"
-        st.caption(f"{df['topic_name'].nunique()} topics · silhouette = {sil:.3f} ({q} separation)"
-                   + (" · k chosen automatically" if auto_k else ""))
+        parts = [f"{df['topic_name'].nunique()} topics"]
+        if topic_mode.startswith("Rules"):
+            parts.append(f"{100 * tinfo['rule_coverage']:.1f}% of texts matched a rule")
+        if not np.isnan(sil):
+            q = "good" if sil > 0.25 else "fair" if sil > 0.1 else "weak"
+            parts.append(f"clusters silhouette = {sil:.3f} ({q} separation)")
+        st.caption(" · ".join(parts))
         if sil_by_k:
-            st.line_chart(pd.Series(sil_by_k, name="silhouette").rename_axis("k"), height=200)
+            st.caption("Cluster quality (silhouette) by number of clusters")
+            st.line_chart(pd.Series(sil_by_k, name="silhouette").rename_axis("k"), height=200, color="#7A7A7A")
         st.dataframe(topic_tbl.round(2), hide_index=True, width="stretch")
-        st.bar_chart(topic_tbl.set_index("topic_name")[["% positive", "% negative"]], height=320)
+        st.bar_chart(topic_tbl.set_index("topic_name")[["% positive", "% negative"]], height=320, color=["#F2C300", "#7A7A7A"])
         st.markdown(describe_tests(topic_tests))
 
         st.subheader("Suggested new intents / pain points")
@@ -608,7 +703,7 @@ def main(df_override: pd.DataFrame | None = None):
             tbl, tests = seg_results[col]
             st.dataframe(tbl.round(2), hide_index=True, width="stretch")
             st.markdown(describe_tests(tests))
-            st.bar_chart(tbl.set_index(col)[["% positive", "% negative"]], height=300)
+            st.bar_chart(tbl.set_index(col)[["% positive", "% negative"]], height=300, color=["#F2C300", "#7A7A7A"])
             st.subheader(f"Topics × {col} (% of texts within each {col})")
             st.dataframe((pd.crosstab(df["topic_name"], df[col], normalize="columns") * 100).round(1),
                          width="stretch")
@@ -655,9 +750,20 @@ def main(df_override: pd.DataFrame | None = None):
             st.info("No label column found (values like positivo / negativo / neutral).")
         else:
             lc = st.selectbox("Label column", label_candidates)
-            others = [c for c in text_candidates if c != lc]
-            default_ix = others.index("comentario") if "comentario" in others else 0
-            tc = st.selectbox("Text column the label refers to", others, index=default_ix)
+            others = [c for c in text_candidates if c != lc and c not in (date_col,)]
+            true_all = df_raw[lc].astype(str).str.lower().str.strip().map(LABEL_MAP)
+
+            def agreement(col):
+                ok = ~df_raw[col].map(is_empty) & true_all.notna()
+                if ok.sum() == 0:
+                    return 0.0
+                pr = [to_label(x, thr) for x in score_texts(tuple(df_raw.loc[ok, col].astype(str)), method)]
+                return float((np.array(pr) == true_all[ok].values).mean())
+
+            scores = {c: agreement(c) for c in others}
+            default_ix = others.index(max(scores, key=scores.get)) if scores else 0
+            tc = st.selectbox("Text column the label refers to", others, index=default_ix,
+                              help="Pre-selected: the column whose text agrees most with the labels.")
             v = df_raw[[tc, lc]].copy()
             v = v[~v[tc].map(is_empty)]
             v["true"] = v[lc].astype(str).str.lower().str.strip().map(LABEL_MAP)
@@ -692,4 +798,3 @@ def main(df_override: pd.DataFrame | None = None):
 
 if __name__ == "__main__":
     main()
-
