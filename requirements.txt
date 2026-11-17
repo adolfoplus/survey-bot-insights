@@ -1,7 +1,9 @@
-streamlit
-pandas
+streamlit>=1.40
+pandas>=2.0
 numpy
-scikit-learn
-matplotlib
-nltk
+scipy
+scikit-learn>=1.2
+# Optional, more accurate Spanish sentiment (adds torch, ~1 GB):
+# pysentimiento
+
 
